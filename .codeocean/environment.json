@@ -1,0 +1,27 @@
+{
+	"version": 1,
+	"base_image": "codeocean/cuda-miniconda-jupyterlab:latest",
+	"post_install": true,
+	"options": {
+		"registry_host_arg": true,
+		"git_ask_pass": true
+	},
+	"installers": {
+		"conda": {
+			"packages": [
+				{
+					"name": "matplotlib",
+					"version": "3.10.0"
+				},
+				{
+					"name": "numpy",
+					"version": "1.26.4"
+				},
+				{
+					"name": "pandas",
+					"version": "2.1.4"
+				}
+			]
+		}
+	}
+}

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -e
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+git clone https://github.com/lindermanlab/ssm
+cd ssm
+pip install numpy cython
+pip install -e .
