@@ -1,2 +1,2 @@
-# Code example
-Minimal code example for the GS-BBVI algorithm.
+# GS-BBVI
+Code for the paper on GS-BBVI.
