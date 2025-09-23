@@ -1,11 +1,9 @@
-# hash:sha256:820b419772d6958fb49e011632bbc78b727f584f8a0640f2fa42f5051a169a5b
+# hash:sha256:1796503d71dabb935b686ab8c82c0fb307f7ef32cb129b22de29ebb510fe2d8a
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/cuda-miniconda-jupyterlab:latest
 
 ARG DEBIAN_FRONTEND=noninteractive
-
 ARG GIT_ASKPASS
-ARG GIT_ACCESS_TOKEN
 COPY git-askpass /
 
 RUN conda install -y \

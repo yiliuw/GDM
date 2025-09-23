@@ -24,11 +24,11 @@ torch.backends.cudnn.benchmark = False  # Disable CuDNN benchmarking
 
 ### GS-BBVI algorithm
 def fit_bbvi_schedule(model, ys, num_iters=100, learning=True, n_samples=10, 
-                     base_lr=1e-2, warmup_iters=30, tau_min=0.99, tau_max=0.99):
+                     base_lr=1e-2, warmup_iters=30, tau_min=0.99, tau_max=0.99, verbose=False):
     device = ys.device
     tau = torch.tensor(tau_max, device=device)
     elbo_history = []
-    convergence_window = 2000  ## determines strictness of convergence
+    convergence_window = 100  ## determines strictness of convergence
     
     # --- Initialize Variational Distribution ---
     T, N = ys.shape
@@ -67,7 +67,7 @@ def fit_bbvi_schedule(model, ys, num_iters=100, learning=True, n_samples=10,
             state_entropy = -(state_counts * torch.log(state_counts + 1e-8)).sum()
             
             ### Optional plotting
-            if (itr % 200 == 0 or itr == num_iters-1):
+            if verbose and (itr % 200 == 0 or itr == num_iters-1):
                 plot_states(torch.argmax(torch.mean(zs, dim=0), dim=1).cpu().numpy())
                 ## Latent trajectory
                 plot_trajectory(
@@ -314,16 +314,18 @@ class RNNGSVariational(nn.Module):
 
 ###---------------------------------------------- Helper function -----------------------------------------------------###    
 ### Plotting utilities
+## discrete states
 def plot_states(z, ls="-", lw=1, alpha=1.0):
     T = z.size
     time = np.arange(T)  # Time axis
-    colors = ['red','blue','green','gold']   
+    n_states = z.max() + 1
+    cmap_obj = plt.get_cmap("tab10", n_states)
     # Plot each state segment
     zcps = np.concatenate(([0], np.where(np.diff(z))[0] + 1, [z.size]))  # Change points
     for start, stop in zip(zcps[:-1], zcps[1:]):
         plt.plot(time[start:stop], z[start:stop],
                  lw=lw, ls=ls,
-                 color=colors[z[start] % len(colors)],
+                 color=cmap_obj.colors[z[start]],
                  alpha=alpha)
     # Add labels and legend
     plt.xlabel("Time")
@@ -331,14 +333,32 @@ def plot_states(z, ls="-", lw=1, alpha=1.0):
     plt.title("Discrete States Over Time")
     plt.show()
 
+## soft states    
+def plot_gs_states(zs):
+    T, K = zs.shape
+    cmap_obj = plt.get_cmap("Accent", K)
+    fig, axes = plt.subplots(K, 1, figsize=(12, 2 * K), sharex=True)
+    for k in range(K):
+        axes[k].plot(zs[:, k], label=f"State {k+1}", color=cmap_obj.colors[k])
+        axes[k].set_ylabel(f"$z_t^{k+1}$")
+        axes[k].legend(loc="upper right")
+        axes[k].grid(True)
+
+    axes[-1].set_xlabel("Time step")
+    fig.suptitle("Gumbel-Softmax State Proportions Over Time", fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+    
+## latent trajectory
 def plot_trajectory(z, x, ls="-", title=''):
-    colors = ['red','blue','green','gold']   
+    n_states = z.max() + 1
+    cmap_obj = plt.get_cmap("Accent", n_states)   
     zcps = np.concatenate(([0], np.where(np.diff(z))[0] + 1, [z.size]))
     for start, stop in zip(zcps[:-1], zcps[1:]):
         plt.plot(x[start:stop + 1, 0],
                 x[start:stop + 1, 1],
                 lw=1, ls=ls,
-                color=colors[z[start] % len(colors)],
+                color=cmap_obj.colors[z[start]],
                 alpha=1.0)
     # Add labels and legend
     plt.title(title)
@@ -347,17 +367,18 @@ def plot_trajectory(z, x, ls="-", title=''):
     
 def plot_observations(z, y, ls="-", lw=1, embed=True):
     zcps = np.concatenate(([0], np.where(np.diff(z))[0] + 1, [z.size]))
-    colors = ['red','blue','green','gold']
+    n_states = z.max() + 1
+    cmap_obj = plt.get_cmap("Accent", n_states)
     T, N = y.shape
     t = np.arange(T)
     for n in range(N):
         for start, stop in zip(zcps[:-1], zcps[1:]):
             plt.plot(t[start:stop + 1], y[start:stop + 1, n],
                     lw=lw, ls=ls,
-                    color=colors[z[start] % len(colors)],
+                    color=cmap_obj.colors[z[start]],
                     alpha=1.0)
     if embed:
-        plt.title("Predited observations for first 400 time steps")
+        plt.title("Predicted observations over time")
         plt.show()
     
 ### Temperature annealing
@@ -416,3 +437,132 @@ def train_metrics(ys, pred_ys0, y_preds=None, k_max=0):
             r2 = compute_r2(y_preds[k:, k - 1], ys[k:])
         r2_scores.append(r2)
     return r2_scores
+
+
+def predict_k_step_more(k_max, model, variational_z, ys, n_trajectory=20, n_samples=100, temperature=0.99):
+    ys_tensor = torch.tensor(ys).to('cuda').float()
+    T, N = ys_tensor.shape
+    device = ys_tensor.device
+    y_preds = torch.zeros((T, k_max, N), device=device)  ## prediction results
+    y_input = ys_tensor.unsqueeze(0).expand(n_trajectory, -1, -1).clone()   ## intermediate predictions
+    z_preds = variational_z.sample_q_z(y_input, temperature)  # intermediate states
+    
+    for k in range(1, k_max + 1):  ## start from 1-step forward
+        projected = torch.einsum('mtn,dn->mtd', y_input, model.F)  # [n_trajectory,T,D]
+        #gs_z1 = dist.RelaxedOneHotCategorical(temperature,logits=model.logits_z1.unsqueeze(0).expand(n_trajectory, -1))
+        #z1 = gs_z1.sample()
+        # Predict next z from x
+        trans = torch.einsum('ntd,kd->ntk', projected[:,:-1], model.Rs) + model.r
+        sticky = z_preds[:,:-1]      ## no stickiness gamma=0    
+        logits_z = (1 - model.gamma) * trans + model.gamma * sticky  
+        logits_exp = logits_z.unsqueeze(0).expand(n_samples, -1, -1, -1)
+        z_full = dist.RelaxedOneHotCategorical(temperature, logits=logits_exp).sample()  # [n_samples, n_trajectory, T-1, K]
+        z_t = z_full.mean(dim=0)  
+        z_preds[:,1:] = z_t
+        
+        y_next = model.smooth(y_input.mean(dim=0), z_preds)  # [n_trajectory,T,N]                 
+        y_preds[k:, k-1] = y_next[:,k:].mean(dim=0)
+        ## update y_input
+        y_input[:,k:] = y_next[:,k:]
+    return y_preds.detach().cpu().numpy(), z_preds
+
+
+@torch.no_grad()
+def predict_k_steps_full(model, variational_z, ys, k=2, n_trajectory=10, temperature=0.99):
+    ys_tensor = torch.tensor(ys, device='cuda').float()  # [T, N]
+    T, N = ys_tensor.shape
+    K, D = model.K, model.D
+    z_t = variational_z.sample_q_z(ys_tensor.unsqueeze(0).expand(n_trajectory, -1, -1), temperature)
+    y_input = ys_tensor.unsqueeze(0).expand(n_trajectory, -1, -1).clone()   ## intermediate predictions
+    y_preds = []
+    for step in range(1, k):  ## 1-step ahead
+        projected = torch.einsum('mtn,dn->mtd', y_input, model.F)  # [n_paths,T,D]
+        trans = torch.einsum('ntd,kd->ntk', projected[:,:-1], model.Rs) + model.r  # [n_paths, T-1, K]
+        z_prev = z_t[:, :-1]                 # [n_paths, T-1, K]
+        logits_next = (1 - model.gamma) * trans + model.gamma * z_prev   # [n_paths, T-1, K]    
+        # Expand to all possibilities 
+        logits_exp = logits_next.unsqueeze(0).expand(n_trajectory, -1, -1, -1)  # [n_trajectory, n_paths, T-1, K]
+        z_next_full = dist.RelaxedOneHotCategorical(temperature, logits=logits_exp).sample()  # [n_trajectory, n_paths, T-1, K]           
+        # Flatten out the possibilities
+        z_next = z_next_full.reshape(-1, T-1, K)        # [n_paths*n_trajectory, T-1, K]
+        # Repeat previous trajectories to match branching
+        z_t = z_t.repeat_interleave(n_trajectory, dim=0)   # [n_paths*n_trajectory, T, K]
+        z_t[:,1:] = z_next
+        ## predictions
+        y_t = model.smooth(y_input.mean(dim=0), z_t)
+        y_preds.append(y_t)                # store full predicted trajectories
+        y_input = y_t.clone()
+    return y_preds, z_t
+
+
+
+@torch.no_grad()
+def predict_k_steps_full(model, variational_z, ys, k=2, n_trajectory=10, temperature=0.99):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ys_tensor = torch.tensor(ys, device=device).float()  # [T, N]
+    T, N = ys_tensor.shape
+    K, D = model.K, model.D
+
+    # Initial sample of z (n_trajectory independent starts)
+    z_paths = variational_z.sample_q_z(
+        ys_tensor.unsqueeze(0).expand(n_trajectory, -1, -1), temperature
+    )  # [n_trajectory, T, K]
+
+    # Initial input Ys for each current path: start with true observed ys replicated
+    y_inputs = ys_tensor.unsqueeze(0).expand(n_trajectory, -1, -1).clone()  # [n_trajectory, T, N]
+
+    # Compute initial predicted outputs per initial path (uses true ys to compute mus)
+    # smooth expects (ys_single, expected_states) where expected_states can be [m,T,K];
+    # we can pass z_paths of shape [n_trajectory, T, K] directly and get [n_trajectory, T, N]
+    y_pred_init = model.smooth(ys_tensor, z_paths)  # [n_trajectory, T, N]
+    y_preds = [y_pred_init.detach()]                # store initial predictions
+    # update y_inputs to the predicted ones (so next step uses predicted ys per path)
+    y_inputs = y_pred_init.clone()                  # [n_trajectory, T, N]
+
+    for step in range(1, k):
+        n_paths = z_paths.shape[0]  # current flattened number of trajectories
+
+        # Project current y_inputs -> [n_paths, T, D]
+        projected = torch.einsum('mtn,dn->mtd', y_inputs, model.F)
+
+        # Transition logits per path: [n_paths, T-1, K]
+        trans = torch.einsum('ntd,kd->ntk', projected[:, :-1], model.Rs) + model.r
+        z_prev = z_paths[:, :-1]  # [n_paths, T-1, K]
+        logits_next = (1 - model.gamma) * trans + model.gamma * z_prev  # [n_paths, T-1, K]
+
+        # Expand each current path into n_trajectory children
+        # logits_exp shape: [n_paths, n_trajectory, T-1, K]
+        logits_exp = logits_next.unsqueeze(1).expand(-1, n_trajectory, -1, -1)
+        z_next_full = dist.RelaxedOneHotCategorical(temperature, logits=logits_exp).sample()
+        # z_next_full: [n_paths, n_trajectory, T-1, K]
+
+        # Build children z: shape [n_paths, n_trajectory, T, K]
+        z_children = z_paths.unsqueeze(1).expand(-1, n_trajectory, -1, -1).clone()
+        z_children[:, :, 1:] = z_next_full
+        # Flatten children into shape [n_paths * n_trajectory, T, K]
+        z_flat = z_children.reshape(-1, T, K)
+
+        # Prepare corresponding y_inputs for each flattened child:
+        # parent y_inputs has shape [n_paths, T, N]; repeat/expand to [n_paths, n_trajectory, T, N] then flatten
+        y_inputs_rep = y_inputs.unsqueeze(1).expand(-1, n_trajectory, -1, -1).reshape(-1, T, N)
+        # Now for each flattened child, call smooth with that child's own ys (parent ys initially),
+        # and the child's z (shape [T,K], we pass as [1,T,K] so smooth returns [1,T,N]).
+        y_pred_list = []
+        for i in range(z_flat.shape[0]):
+            # Use the parent's ys (which we just repeated); smooth will compute mus from that ys
+            # and combine with the child's expected_states (z_flat[i:i+1]) to produce [1,T,N]
+            y_hat_i = model.smooth(y_inputs_rep[i], z_flat[i:i+1])  # [1, T, N]
+            y_pred_list.append(y_hat_i.squeeze(0))                 # [T, N]
+
+        # Stack predicted ys for all children: [n_paths * n_trajectory, T, N]
+        y_pred_flat = torch.stack(y_pred_list, dim=0)
+
+        # Store and update for next iteration (flattened form)
+        y_preds.append(y_pred_flat.detach())
+        z_paths = z_flat
+        y_inputs = y_pred_flat.clone()
+
+    # After loop:
+    # y_preds is a list: y_preds[0] shape [n_trajectory, T, N], y_preds[1] shape [n_trajectory^2, T, N], ...
+    # z_paths is final flattened latent trajectories: [n_trajectory**(k), T, K] if you ran k-1 expansions
+    return y_preds, z_paths
