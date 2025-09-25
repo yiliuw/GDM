@@ -1,4 +1,4 @@
-'''Batched version GS-BBVI for 2-level GDM'''
+'''Batched RNN version GS-BBVI for 2-level GDM'''
 import torch
 import math
 import numpy as np
