@@ -23,6 +23,19 @@ torch.backends.cudnn.deterministic = True  # Ensure CuDNN is deterministic
 torch.backends.cudnn.benchmark = False  # Disable CuDNN benchmarking
 
 
+# --- Numerical-stability helper ---
+def stabilize_logits(logits, clamp=30.0, name="logits"):
+    """Keep RelaxedOneHotCategorical logits finite and numerically tame."""
+    if not torch.isfinite(logits).all():
+        bad_frac = (~torch.isfinite(logits)).float().mean().detach().cpu().item()
+        raise FloatingPointError(
+            f"Non-finite {name} before stabilization. bad_frac={bad_frac:.6f}"
+        )
+    logits = logits - logits.amax(dim=-1, keepdim=True)
+    logits = logits.clamp(min=-clamp, max=clamp)
+    return logits
+
+
 ### GS-BBVI algorithm
 def fit_bbvi_schedule(model, trials, num_iters=100, learning=True, n_samples=10, 
                      base_lr=1e-2, warmup_iters=30, tau_min=0.99, tau_max=0.99, 
@@ -31,7 +44,7 @@ def fit_bbvi_schedule(model, trials, num_iters=100, learning=True, n_samples=10,
     device = next(model.parameters()).device
     tau = torch.tensor(tau_max, device=device)
     elbo_history = []
-    convergence_window = 100
+    convergence_window = 2000
     
     # Variational distribution 
     N = trials[0].shape[1]  # assume consistent across trials
@@ -73,8 +86,9 @@ def fit_bbvi_schedule(model, trials, num_iters=100, learning=True, n_samples=10,
                 log_py = model.log_emission_likelihood(ys_batch, zs, mask)
                 log_qz = variational_z.log_density(zs, ys_batch, tau, mask)
 
-                # Encourage diverse state usage
-                state_counts = zs.mean(dim=(0,1,2))  # [K] averaged across M,B,T
+                # Encourage diverse state usage, using only valid non-padded timesteps.
+                state_weights = mask.unsqueeze(-1)  # [M,B,T,1]
+                state_counts = (zs * state_weights).sum(dim=(0,1,2)) / (state_weights.sum() + 1e-8)
                 state_entropy = -(state_counts * torch.log(state_counts + 1e-8)).sum()
 
                 if verbose and (itr % 200 == 0 or itr == num_iters-1):
@@ -98,7 +112,7 @@ def fit_bbvi_schedule(model, trials, num_iters=100, learning=True, n_samples=10,
                             torch.argmax(zs_first.mean(dim=0), dim=1).cpu().numpy(),
                             y_preds0.mean(dim=0)[:400, :1].cpu().numpy())
 
-                        print("R2:", train_metrics(torch.tensor(ys_first), y_preds0.mean(dim=0).cpu()))
+                        print("R2:", train_metrics(ys_first.detach().cpu(), y_preds0.mean(dim=0).detach().cpu()))
                     
                 return (log_pz + log_py - log_qz).mean() + state_entropy
 
@@ -176,19 +190,20 @@ class GenerativeSLDS(nn.Module):
         # Optional control input matrices V_k (K, N, M)
         self.Vs = nn.Parameter(torch.randn(K, N, M, device=device) * 0.1) if M > 0 else None
         # Initial mean values (K, D)
-        self.mu_init = nn.Parameter(torch.randn(K, N, device=device)) 
+        self.mu_init = nn.Parameter(torch.randn(K, N, device=device) / math.sqrt(max(1, N))) 
              
         '''Discrete latent variables z_{1:T} for state switching'''
-        self.F = nn.Parameter(torch.randn(D, N, device=device) * 0.1)  
-        self.Rs = nn.Parameter(torch.randn(K, D, device=device))
+        self.F = nn.Parameter(torch.randn(D, N, device=device) / math.sqrt(max(1, N)))  
+        self.Rs = nn.Parameter(torch.randn(K, D, device=device) / math.sqrt(max(1, D)))
         self.r = nn.Parameter(torch.zeros(K, device=device))
         '''Stickiness parameter gamma'''
-        self.gamma = nn.Parameter(torch.tensor(0.1, device=device))  ## stickiness 
+        # Optimize an unconstrained logit while exposing gamma in (0, 1).
+        self.gamma_logit = nn.Parameter(torch.tensor(math.log(0.1 / 0.9), device=device))
         self.logits_z1 = nn.Parameter(torch.zeros(K, device=device))
         
         '''Observation parameters'''
         # Random projection matrix
-        C = torch.randn(N, D, device=device) 
+        C = torch.randn(N, D, device=device) / math.sqrt(max(1, D)) 
         # Random transition matrices A_k (K, D, D*lags)
         As = torch.stack([torch.stack([self._random_rotation(D) for _ in range(lags)], dim=0) for _ in range(K)],dim=0).to(device)
         self.Ss = nn.Parameter(torch.einsum("nd,kldm->klnm", C, As))
@@ -200,10 +215,14 @@ class GenerativeSLDS(nn.Module):
             # self.L = nn.Parameter(torch.eye(N, device=device).unsqueeze(0).expand(1, N, N))
     
     @property
+    def gamma(self):
+        return torch.sigmoid(self.gamma_logit)
+
+    @property
     def params(self):
         params = [
-            self.mu_init, self.Ss, self.bs,  # Observation parameters (y)
-            self.Rs, self.r, self.gamma, self.logits_z1 # Discrete state parameters (z)
+            self.mu_init, self.F, self.Ss, self.bs,  # Observation parameters (y)
+            self.Rs, self.r, self.gamma_logit, self.logits_z1 # Discrete state parameters (z)
         ]
         if self.emission_model == "gaussian":
             params.append(self.log_var)
@@ -226,7 +245,8 @@ class GenerativeSLDS(nn.Module):
             mus = torch.zeros(self.K, T, self.N, device=device) 
             # initial lags
             if self.lags > 0:
-                mus[:, :self.lags] = self.mu_init[:, None, :].expand(-1, self.lags, -1)  # [K, lags, N]
+                n_init = min(self.lags, T)
+                mus[:, :n_init] = self.mu_init[:, None, :].expand(-1, n_init, -1)  # [K, n_init, N]
             if T > self.lags:
                 # lagged_ys: [T-lags, lags, D]
                 lagged_ys = torch.stack([
@@ -255,9 +275,10 @@ class GenerativeSLDS(nn.Module):
             device = projected_ys.device
             mus = torch.zeros(self.K, B, T, self.N, device=device)  # [K,B,T,N]
     
-            # initial lags: expand mu_init across batch and lags
+            # initial lags: expand mu_init across batch and available timesteps
             if self.lags > 0:
-                mus[:, :, :self.lags] = self.mu_init[:, None, None, :].expand(-1, B, self.lags, -1)
+                n_init = min(self.lags, T)
+                mus[:, :, :n_init] = self.mu_init[:, None, None, :].expand(-1, B, n_init, -1)
     
             if T > self.lags:
                 # lagged_ys: [B, T-lags, lags, D]
@@ -289,7 +310,8 @@ class GenerativeSLDS(nn.Module):
         zs_normalized = zs / (zs.sum(dim=-1, keepdim=True) + 1e-8)
     
         # Prior over initial z_1
-        gs_z1 = dist.RelaxedOneHotCategorical(temperature, logits=self.logits_z1)
+        logits_z1 = stabilize_logits(self.logits_z1, name="logits_z1")
+        gs_z1 = dist.RelaxedOneHotCategorical(temperature, logits=logits_z1)
         log_prior_z1 = gs_z1.log_prob(zs_normalized[:, :, 0])  # [M, B]
     
         # Project ys into latent space for transitions
@@ -297,7 +319,8 @@ class GenerativeSLDS(nn.Module):
         trans = torch.einsum('mbtd,kd->mbtk', projected_ys, self.Rs) + self.r  # [M,B,T-1,K]
         # Stickiness
         sticky = zs[:, :, :-1]  # [M,B,T-1,K]
-        log_Ps = (1 - self.gamma) * trans + self.gamma * sticky  # [M,B,T-1,K]
+        log_Ps_raw = (1 - self.gamma) * trans + self.gamma * sticky  # [M,B,T-1,K]
+        log_Ps = stabilize_logits(log_Ps_raw, name="transition_logits")
     
         # Relaxed categorical for z_t | z_{t-1}
         gs = dist.RelaxedOneHotCategorical(temperature, logits=log_Ps)
@@ -329,7 +352,8 @@ class GenerativeSLDS(nn.Module):
             lambdas = F.softplus(mean)
             log_lik = ys * torch.log(lambdas + 1e-8) - lambdas
         else:
-            variance = torch.exp(self.log_var)  # shape [N] or [1,N]
+            log_var = self.log_var.clamp(min=-6.0, max=4.0)
+            variance = torch.exp(log_var)  # shape [N] or [1,N]
             # broadcast variance across M,B,T
             log_lik = -0.5 * (((ys - mean) ** 2) / variance + torch.log(2 * math.pi * variance))
     
@@ -411,7 +435,7 @@ class GSVariational(nn.Module):
         super().__init__()
         self.K = K
         self.N = N      
-        self.W = nn.Parameter(0.8 * torch.randn(K, N, device=device)) 
+        self.W = nn.Parameter(torch.randn(K, N, device=device) / math.sqrt(max(1, N))) 
         self.b = nn.Parameter(torch.zeros(K, device=device)) 
 
     @property
@@ -421,7 +445,8 @@ class GSVariational(nn.Module):
     
     def log_density(self, zs, ys, temperature, mask=None):
         zs_normalized = zs / (zs.sum(dim=-1, keepdim=True) + 1e-8)
-        log_Ps = torch.einsum('mbtn,kn->mbtk', ys, self.W) + self.b  # [M,B,T,K]
+        log_Ps_raw = torch.einsum('mbtn,kn->mbtk', ys, self.W) + self.b  # [M,B,T,K]
+        log_Ps = stabilize_logits(log_Ps_raw, name="q_logits")
         q_dist = dist.RelaxedOneHotCategorical(temperature, logits=log_Ps)
         log_probs = q_dist.log_prob(zs_normalized)  # [M,B,T]
 
@@ -433,7 +458,8 @@ class GSVariational(nn.Module):
 
     def sample_q_z(self, ys, temperature):   
         M, B, T, N = ys.shape
-        log_Ps = torch.einsum('mbtn,kn->mbtk', ys, self.W) + self.b  # [M,B,T,K]
+        log_Ps_raw = torch.einsum('mbtn,kn->mbtk', ys, self.W) + self.b  # [M,B,T,K]
+        log_Ps = stabilize_logits(log_Ps_raw, name="q_logits")
         q_dist = dist.RelaxedOneHotCategorical(temperature, logits=log_Ps)
         zs = q_dist.rsample()  # [M,B,T,K]
         return zs
@@ -474,6 +500,7 @@ class RNNGSVariational(nn.Module):
         M,B,T,N = ys.shape
         h, _ = self.rnn(ys.reshape(-1, T, N))      # [M*B,T,H]
         logits = self.out(h).view(M,B,T,-1)        # [M,B,T,K]
+        logits = stabilize_logits(logits, name="rnn_q_logits")
         q_dist = dist.RelaxedOneHotCategorical(temperature, logits=logits)
         log_probs = q_dist.log_prob(zs_normalized) # [M,B,T]
 
@@ -486,6 +513,7 @@ class RNNGSVariational(nn.Module):
         ys_flat = ys.reshape(M * B, T, N)  # merge batch for RNN
         h, _ = self.rnn(ys_flat)           # [M*B,T,H]
         logits = self.out(h).reshape(M, B, T, self.K)  # [M,B,T,K]
+        logits = stabilize_logits(logits, name="rnn_q_logits")
         q_dist = dist.RelaxedOneHotCategorical(temperature, logits=logits)
         zs = q_dist.rsample()              # [M,B,T,K]
         return zs
@@ -650,6 +678,7 @@ def predict_k_step_more(k_max, model, variational_z, ys,
         trans = torch.einsum('mbtd,kd->mbtk', projected[:, :, :-1], model.Rs) + model.r
         sticky = z_preds[:, :, :-1]  # [M,B,T-1,K]
         logits_z = (1 - model.gamma) * trans + model.gamma * sticky
+        logits_z = stabilize_logits(logits_z, name="predict_transition_logits")
 
         # Sample future z
         logits_exp = logits_z.unsqueeze(0).expand(n_samples, -1, -1, -1, -1)  # [n_samples,M,B,T-1,K]
